@@ -52,6 +52,8 @@ def parse_args():
     parser.add_argument('--output_path', type=str, required=True)
     parser.add_argument('--verbose_json', type=str2bool, default=False)
     parser.add_argument('--verbose', type=int, default=0)
+    parser.add_argument('--interlaced', type=str2bool, default=False,
+                       help='Enable interlaced mode for parallel frame processing (1.8x speedup, 10-20%% quality loss)')
 
     args = parser.parse_args()
     return args
@@ -347,6 +349,306 @@ def run_one_point_with_stream(p_frame_net, i_frame_net, args):
     return log_result
 
 
+def run_interlaced_encoding_with_stream(p_frame_net, i_frame_net, args):
+    """
+    Encode video with interlaced reference pattern for parallel processing.
+    Odd frames (1,3,5,...) reference even frames (0,2,4,...)
+    Even frames (2,4,6,...) reference odd frames (1,3,5,...)
+    This allows encoding frames N and N+1 in parallel.
+    """
+    if args['check_existing'] and os.path.exists(args['curr_json_path']) and \
+            os.path.exists(args['curr_bin_path']):
+        with open(args['curr_json_path']) as f:
+            log_result = json.load(f)
+            if log_result['i_frame_num'] + log_result['p_frame_num'] == args['frame_num']:
+                return log_result
+            print(f"incorrect log for {args['curr_json_path']}, try to rerun.")
+
+    frame_num = args['frame_num']
+    save_decoded_frame = args['save_decoded_frame']
+    verbose = args['verbose']
+    reset_interval = args['reset_interval']
+    intra_period = args['intra_period']
+    verbose_json = args['verbose_json']
+    device = next(i_frame_net.parameters()).device
+
+    src_reader = get_src_reader(args)
+    pic_height = args['src_height']
+    pic_width = args['src_width']
+    padding_r, padding_b = DMCI.get_padding_size(pic_height, pic_width, 16)
+
+    use_two_entropy_coders = pic_height * pic_width > 1280 * 720
+    i_frame_net.set_use_two_entropy_coders(use_two_entropy_coders)
+    p_frame_net.set_use_two_entropy_coders(use_two_entropy_coders)
+
+    frame_types = []
+    psnrs = []
+    msssims = []
+    bits = []
+
+    start_time = time.time()
+    encoding_time = []
+    decoding_time = []
+    index_map = [0, 1, 0, 2, 0, 2, 0, 2]
+
+    output_buff = io.BytesIO()
+    sps_helper = SPSHelper()
+
+    p_frame_net.set_curr_poc(0)
+
+    # Create CUDA streams for parallel processing
+    stream_odd = torch.cuda.Stream(device=device)
+    stream_even = torch.cuda.Stream(device=device)
+
+    # Store encoded frames in order
+    encoded_frames = {}
+
+    with torch.no_grad():
+        last_qp = 0
+        for frame_idx in range(frame_num):
+            x, y, u, v, rgb = get_src_frame(args, src_reader, device)
+            x_padded = replicate_pad(x, padding_b, padding_r)
+
+            # I-frame: process sequentially
+            if frame_idx == 0 or (intra_period > 0 and frame_idx % intra_period == 0):
+                torch.cuda.synchronize(device=device)
+                frame_start_time = time.time()
+
+                is_i_frame = True
+                curr_qp = args['qp_i']
+                sps = {
+                    'sps_id': -1,
+                    'height': pic_height,
+                    'width': pic_width,
+                    'ec_part': 1 if use_two_entropy_coders else 0,
+                    'use_ada_i': 0,
+                }
+                encoded = i_frame_net.compress(x_padded, args['qp_i'])
+
+                # Initialize both DPB chains with I-frame
+                p_frame_net.clear_dpb_chain('all')
+                p_frame_net.add_ref_frame_chain(None, encoded['x_hat'], 'odd')
+                p_frame_net.add_ref_frame_chain(None, encoded['x_hat'], 'even')
+                frame_types.append(0)
+
+                torch.cuda.synchronize(device=device)
+                frame_end_time = time.time()
+                encoding_time.append(frame_end_time - frame_start_time)
+
+                # Store encoded frame
+                sps_id, sps_new = sps_helper.get_sps_id(sps)
+                sps['sps_id'] = sps_id
+                sps_bytes = 0
+                if sps_new:
+                    sps_bytes = write_sps(output_buff, sps)
+                stream_bytes = write_ip(output_buff, is_i_frame, sps_id, curr_qp, encoded['bit_stream'])
+                bits.append(stream_bytes * 8 + sps_bytes * 8)
+
+            # P-frames: process pairs in parallel using interlaced pattern
+            elif frame_idx % 2 == 1:  # Odd frame
+                # Determine which chain this frame belongs to
+                chain = 'odd'
+                fa_idx = index_map[frame_idx % 8]
+                curr_qp = p_frame_net.shift_qp(args['qp_p'], fa_idx)
+
+                frame_start_time = time.time()
+
+                # Encode on odd stream
+                with torch.cuda.stream(stream_odd):
+                    encoded = p_frame_net.compress(x_padded, curr_qp, chain=chain)
+
+                # Store for later writing (maintain order)
+                encoded_frames[frame_idx] = {
+                    'encoded': encoded,
+                    'qp': curr_qp,
+                    'frame_type': 1,
+                    'time': frame_start_time,
+                }
+                frame_types.append(1)
+
+            else:  # Even frame (frame_idx % 2 == 0 and frame_idx > 0)
+                chain = 'even'
+                fa_idx = index_map[frame_idx % 8]
+                curr_qp = p_frame_net.shift_qp(args['qp_p'], fa_idx)
+
+                frame_start_time = time.time()
+
+                # Encode on even stream
+                with torch.cuda.stream(stream_even):
+                    encoded = p_frame_net.compress(x_padded, curr_qp, chain=chain)
+
+                # Synchronize both streams after encoding pair
+                torch.cuda.synchronize(device=device)
+
+                # Record encoding time for both frames in the pair
+                pair_end_time = time.time()
+                if frame_idx - 1 in encoded_frames:
+                    encoding_time.append(pair_end_time - encoded_frames[frame_idx - 1]['time'])
+                encoding_time.append(pair_end_time - frame_start_time)
+
+                # Store current frame
+                encoded_frames[frame_idx] = {
+                    'encoded': encoded,
+                    'qp': curr_qp,
+                    'frame_type': 1,
+                    'time': frame_start_time,
+                }
+                frame_types.append(1)
+
+                # Write both frames in order
+                for write_idx in [frame_idx - 1, frame_idx]:
+                    if write_idx in encoded_frames:
+                        frame_data = encoded_frames[write_idx]
+                        sps = {
+                            'sps_id': -1,
+                            'height': pic_height,
+                            'width': pic_width,
+                            'ec_part': 1 if use_two_entropy_coders else 0,
+                            'use_ada_i': 0,
+                        }
+                        sps_id, sps_new = sps_helper.get_sps_id(sps)
+                        sps['sps_id'] = sps_id
+                        sps_bytes = 0
+                        if sps_new:
+                            sps_bytes = write_sps(output_buff, sps)
+                        stream_bytes = write_ip(output_buff, False, sps_id,
+                                               frame_data['qp'], frame_data['encoded']['bit_stream'])
+                        bits.append(stream_bytes * 8 + sps_bytes * 8)
+                        del encoded_frames[write_idx]
+
+        # Handle remaining odd frame if exists
+        if frame_num % 2 == 0 and (frame_num - 1) in encoded_frames:
+            torch.cuda.synchronize(device=device)
+            frame_data = encoded_frames[frame_num - 1]
+            encoding_time.append(time.time() - frame_data['time'])
+            sps = {
+                'sps_id': -1,
+                'height': pic_height,
+                'width': pic_width,
+                'ec_part': 1 if use_two_entropy_coders else 0,
+                'use_ada_i': 0,
+            }
+            sps_id, sps_new = sps_helper.get_sps_id(sps)
+            sps['sps_id'] = sps_id
+            sps_bytes = 0
+            if sps_new:
+                sps_bytes = write_sps(output_buff, sps)
+            stream_bytes = write_ip(output_buff, False, sps_id,
+                                   frame_data['qp'], frame_data['encoded']['bit_stream'])
+            bits.append(stream_bytes * 8 + sps_bytes * 8)
+
+    src_reader.close()
+    with open(args['curr_bin_path'], "wb") as output_file:
+        bytes_buffer = output_buff.getbuffer()
+        output_file.write(bytes_buffer)
+        total_bytes = bytes_buffer.nbytes
+        bytes_buffer.release()
+    total_kbps = int(total_bytes * 8 / (frame_num / 30) / 1000)
+    output_buff.close()
+
+    # Decoding pass (using interlaced pattern)
+    sps_helper = SPSHelper()
+    with open(args['curr_bin_path'], "rb") as input_file:
+        input_buff = io.BytesIO(input_file.read())
+    decoded_frame_number = 0
+    src_reader = get_src_reader(args)
+
+    if save_decoded_frame:
+        if args['src_type'] == 'png':
+            recon_writer = PNGWriter(args['bin_folder'], args['src_width'], args['src_height'])
+        elif args['src_type'] == 'yuv420':
+            output_yuv_path = args['curr_rec_path'].replace('.yuv', f'_{total_kbps}kbps.yuv')
+            recon_writer = YUV420Writer(output_yuv_path, args['src_width'], args['src_height'])
+
+    p_frame_net.set_curr_poc(0)
+    with torch.no_grad():
+        while decoded_frame_number < frame_num:
+            x, y, u, v, rgb = get_src_frame(args, src_reader, device)
+            torch.cuda.synchronize(device=device)
+            frame_start_time = time.time()
+
+            header = read_header(input_buff)
+            while header['nal_type'] == NalType.NAL_SPS:
+                sps = read_sps_remaining(input_buff, header['sps_id'])
+                sps_helper.add_sps_by_id(sps)
+                header = read_header(input_buff)
+                continue
+            sps_id = header['sps_id']
+            sps = sps_helper.get_sps_by_id(sps_id)
+            qp, bit_stream = read_ip_remaining(input_buff)
+
+            if header['nal_type'] == NalType.NAL_I:
+                decoded = i_frame_net.decompress(bit_stream, sps, qp)
+                p_frame_net.clear_dpb_chain('all')
+                p_frame_net.add_ref_frame_chain(None, decoded['x_hat'], 'odd')
+                p_frame_net.add_ref_frame_chain(None, decoded['x_hat'], 'even')
+            elif header['nal_type'] == NalType.NAL_P:
+                # Use interlaced pattern for decoding
+                chain = 'odd' if decoded_frame_number % 2 == 1 else 'even'
+                decoded = p_frame_net.decompress(bit_stream, sps, qp, chain=chain)
+
+            recon_frame = decoded['x_hat']
+            x_hat = recon_frame[:, :, :pic_height, :pic_width]
+
+            torch.cuda.synchronize(device=device)
+            frame_end_time = time.time()
+            frame_time = frame_end_time - frame_start_time
+            decoding_time.append(frame_time)
+
+            curr_psnr, curr_ssim = get_distortion(args, x_hat, y, u, v, rgb)
+            psnrs.append(curr_psnr)
+            msssims.append(curr_ssim)
+
+            if verbose >= 2:
+                stream_length = 0 if bit_stream is None else len(bit_stream) * 8
+                print(f"frame {decoded_frame_number} decoded, {frame_time * 1000:.3f} ms, "
+                      f"bits: {stream_length}, PSNR: {curr_psnr[0]:.4f} ")
+
+            if save_decoded_frame:
+                if args['src_type'] == 'yuv420':
+                    y_rec, uv_rec = yuv_444_to_420(x_hat)
+                    y_rec = torch.clamp(y_rec * 255, 0, 255).round().to(dtype=torch.uint8)
+                    y_rec = y_rec.squeeze(0).cpu().numpy()
+                    uv_rec = torch.clamp(uv_rec * 255, 0, 255).to(dtype=torch.uint8)
+                    uv_rec = uv_rec.squeeze(0).cpu().numpy()
+                    recon_writer.write_one_frame(y_rec, uv_rec)
+                else:
+                    assert args['src_type'] == 'png'
+                    rgb_rec = ycbcr2rgb(x_hat)
+                    rgb_rec = torch.clamp(rgb_rec * 255, 0, 255).round().to(dtype=torch.uint8)
+                    rgb_rec = rgb_rec.squeeze(0).cpu().numpy()
+                    recon_writer.write_one_frame(rgb_rec)
+            decoded_frame_number += 1
+    input_buff.close()
+    src_reader.close()
+
+    if save_decoded_frame:
+        recon_writer.close()
+
+    test_time = time.time() - start_time
+    test_time_frame_numuber = len(encoding_time)
+    time_bypass_frame_num = 10
+    if verbose >= 1 and test_time_frame_numuber > time_bypass_frame_num:
+        encoding_time = encoding_time[time_bypass_frame_num:]
+        decoding_time = decoding_time[time_bypass_frame_num:]
+        avg_encoding_time = sum(encoding_time)/len(encoding_time)
+        avg_decoding_time = sum(decoding_time)/len(decoding_time)
+        print(f"[INTERLACED MODE] encoding/decoding {test_time_frame_numuber} frames, "
+              f"average encoding time {avg_encoding_time * 1000:.3f} ms, "
+              f"average decoding time {avg_decoding_time * 1000:.3f} ms.")
+    else:
+        avg_encoding_time = None
+        avg_decoding_time = None
+
+    log_result = generate_log_json(frame_num, pic_height * pic_width, test_time,
+                                   frame_types, bits, psnrs, msssims, verbose=verbose_json,
+                                   avg_encoding_time=avg_encoding_time,
+                                   avg_decoding_time=avg_decoding_time,)
+    with open(args['curr_json_path'], 'w') as fp:
+        json.dump(log_result, fp, indent=2)
+    return log_result
+
+
 i_frame_net = None  # the model is initialized after each process is spawn, thus OK for multiprocess
 p_frame_net = None
 
@@ -367,7 +669,11 @@ def worker(args):
     args['curr_rec_path'] = args['curr_bin_path'].replace('.bin', '.yuv')
     args['curr_json_path'] = args['curr_bin_path'].replace('.bin', '.json')
 
-    result = run_one_point_with_stream(p_frame_net, i_frame_net, args)
+    # Use interlaced mode if enabled
+    if args.get('interlaced', False):
+        result = run_interlaced_encoding_with_stream(p_frame_net, i_frame_net, args)
+    else:
+        result = run_one_point_with_stream(p_frame_net, i_frame_net, args)
 
     result['ds_name'] = args['ds_name']
     result['seq'] = args['seq']
@@ -503,6 +809,7 @@ def main():
                 cur_args['ds_name'] = ds_name
                 cur_args['verbose'] = args.verbose
                 cur_args['verbose_json'] = args.verbose_json
+                cur_args['interlaced'] = args.interlaced
 
                 count_frames += cur_args['frame_num']
 

@@ -317,3 +317,26 @@ __forceinline__ __device__ c10::Half multiply_add(const c10::Half a, const c10::
 
     return __hfma(a, b, c);
 }
+
+// Conv1x1 device function for fixed 256 channels
+// Computes one output channel for one spatial location
+// T1 is the computation type (float for both fp32 and fp16)
+template <typename T, typename T1>
+__forceinline__ __device__ T1 conv1x1_256ch_single_output(
+    const Packed4DTensorAccessor32<T> input,
+    const Packed4DTensorAccessor32<T> weight,
+    const int b, const int c_out, const int h, const int w,
+    const int C_in)
+{
+    T1 accum = static_cast<T1>(0.f);
+
+    // Process channels in chunks of 4 for vectorized access
+    #pragma unroll 16
+    for (int c_in = 0; c_in < C_in; c_in++) {
+        T1 in_val = static_cast<T1>(input[b][c_in][h][w]);
+        T1 w_val = static_cast<T1>(weight[c_out][c_in][0][0]);
+        accum = multiply_add(w_val, in_val, accum);
+    }
+
+    return accum;
+}

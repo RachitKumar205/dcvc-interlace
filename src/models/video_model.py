@@ -250,6 +250,11 @@ class DMC(CompressionModel):
         self.max_dpb_size = 1
         self.curr_poc = 0
 
+        # Dual DPB for interlaced inference (parallel processing)
+        self.dpb_odd = []   # DPB for odd frame chain (1, 3, 5, ...)
+        self.dpb_even = []  # DPB for even frame chain (2, 4, 6, ...)
+        self.current_chain = None  # Track active chain
+
     def reset_ref_feature(self):
         if len(self.dpb) > 0:
             self.dpb[0].feature = None
@@ -271,10 +276,76 @@ class DMC(CompressionModel):
     def set_curr_poc(self, poc):
         self.curr_poc = poc
 
+    # Chain-aware DPB methods for interlaced inference
+    def add_ref_frame_chain(self, feature=None, frame=None, chain='legacy', increase_poc=True):
+        """Add reference frame to specific chain (odd/even/legacy)"""
+        ref_frame = RefFrame()
+        ref_frame.poc = self.curr_poc
+        ref_frame.frame = frame
+        ref_frame.feature = feature
+
+        # Select appropriate DPB based on chain
+        if chain == 'odd':
+            dpb = self.dpb_odd
+        elif chain == 'even':
+            dpb = self.dpb_even
+        else:  # 'legacy' or None
+            dpb = self.dpb
+
+        # Add to selected DPB
+        if len(dpb) >= self.max_dpb_size:
+            dpb.pop(-1)
+        dpb.insert(0, ref_frame)
+
+        if increase_poc:
+            self.curr_poc += 1
+
+    def get_ref_frame_chain(self, chain='legacy'):
+        """Get reference frame from specific chain"""
+        if chain == 'odd':
+            dpb = self.dpb_odd
+        elif chain == 'even':
+            dpb = self.dpb_even
+        else:  # 'legacy' or None
+            dpb = self.dpb
+
+        if len(dpb) > 0:
+            return dpb[0]
+        return None
+
+    def clear_dpb_chain(self, chain='legacy'):
+        """Clear specific DPB chain"""
+        if chain == 'odd':
+            self.dpb_odd.clear()
+        elif chain == 'even':
+            self.dpb_even.clear()
+        elif chain == 'all':
+            self.dpb.clear()
+            self.dpb_odd.clear()
+            self.dpb_even.clear()
+        else:  # 'legacy'
+            self.dpb.clear()
+
+    def reset_ref_feature_chain(self, chain='legacy'):
+        """Reset reference feature for specific chain"""
+        ref_frame = self.get_ref_frame_chain(chain)
+        if ref_frame is not None:
+            ref_frame.feature = None
+
     def apply_feature_adaptor(self):
         if self.dpb[0].feature is None:
             return self.feature_adaptor_i(F.pixel_unshuffle(self.dpb[0].frame, 8))
         return self.feature_adaptor_p(self.dpb[0].feature)
+
+    def apply_feature_adaptor_chain(self, chain='legacy'):
+        """Apply feature adaptor using reference from specific chain"""
+        ref_frame = self.get_ref_frame_chain(chain)
+        if ref_frame is None:
+            raise RuntimeError(f"No reference frame available in chain '{chain}'")
+
+        if ref_frame.feature is None:
+            return self.feature_adaptor_i(F.pixel_unshuffle(ref_frame.frame, 8))
+        return self.feature_adaptor_p(ref_frame.feature)
 
     def res_prior_param_decoder(self, z_hat, ctx_t):
         hierarchical_params = self.hyper_decoder(z_hat)
@@ -296,15 +367,21 @@ class DMC(CompressionModel):
             self.dpb[0].frame = self.recon_generation_net(self.dpb[0].feature, q_recon).clamp_(0, 1)
             self.reset_ref_feature()
 
-    def compress(self, x, qp):
+    def compress(self, x, qp, chain='legacy'):
         # pic_width and pic_height may be different from x's size. x here is after padding
         # x_hat has the same size with x
+        # chain: 'legacy' (default), 'odd', or 'even' for interlaced mode
         device = x.device
         q_encoder = self.q_encoder[qp:qp+1, :, :, :]
         q_decoder = self.q_decoder[qp:qp+1, :, :, :]
         q_feature = self.q_feature[qp:qp+1, :, :, :]
 
-        feature = self.apply_feature_adaptor()
+        # Use chain-aware feature adaptor
+        if chain == 'legacy':
+            feature = self.apply_feature_adaptor()
+        else:
+            feature = self.apply_feature_adaptor_chain(chain)
+
         ctx, ctx_t = self.feature_extractor(feature, q_feature)
         y = self.encoder(x, ctx, q_encoder)
 
@@ -335,12 +412,20 @@ class DMC(CompressionModel):
         bit_stream = self.entropy_coder.get_encoded_stream()
 
         torch.cuda.synchronize(device=device)
-        self.add_ref_frame(feature, None)
+
+        # Use chain-aware DPB update
+        if chain == 'legacy':
+            self.add_ref_frame(feature, None)
+        else:
+            self.add_ref_frame_chain(feature, None, chain)
+
         return {
             'bit_stream': bit_stream,
+            'x_hat': None,  # Not computed in compress
         }
 
-    def decompress(self, bit_stream, sps, qp):
+    def decompress(self, bit_stream, sps, qp, chain='legacy'):
+        # chain: 'legacy' (default), 'odd', or 'even' for interlaced mode
         dtype = next(self.parameters()).dtype
         device = next(self.parameters()).device
         q_decoder = self.q_decoder[qp:qp+1, :, :, :]
@@ -352,7 +437,12 @@ class DMC(CompressionModel):
         z_size = self.get_downsampled_shape(sps['height'], sps['width'], 64)
         self.bit_estimator_z.decode_z(z_size, qp)
 
-        feature = self.apply_feature_adaptor()
+        # Use chain-aware feature adaptor
+        if chain == 'legacy':
+            feature = self.apply_feature_adaptor()
+        else:
+            feature = self.apply_feature_adaptor_chain(chain)
+
         c1, ctx_t = self.feature_extractor.forward_part1(feature, q_feature)
 
         z_hat = self.bit_estimator_z.get_z(z_size, device, dtype)
@@ -370,7 +460,12 @@ class DMC(CompressionModel):
         cuda_event.wait()
         x_hat, feature = self.get_recon_and_feature(y_hat, ctx, q_decoder, q_recon)
 
-        self.add_ref_frame(feature, x_hat)
+        # Use chain-aware DPB update
+        if chain == 'legacy':
+            self.add_ref_frame(feature, x_hat)
+        else:
+            self.add_ref_frame_chain(feature, x_hat, chain)
+
         return {
             'x_hat': x_hat,
         }
